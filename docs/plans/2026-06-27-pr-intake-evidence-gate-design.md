@@ -21,9 +21,16 @@ user-visible changes and asks for missing evidence. The gate should reduce false
 negatives more than false positives: asking for extra evidence is acceptable,
 missing a PR that needs evidence is not.
 
+The first milestone is automatic external PR coverage for PR-standard checks:
+template completeness, test-plan presence, and before/after evidence for likely
+user-visible changes. It should make external PRs visible to maintainers earlier
+without running the existing full triage or review agents automatically.
+
 ## Non-goals
 
 - Do not run full triage, review, or tmux testing for untrusted PR authors.
+- Do not use a precheck result to automatically promote an untrusted PR into the
+  existing full triage or review workflow.
 - Do not execute PR code: no install, build, test, scripts, or tmux session.
 - Do not check out the PR head as a working tree.
 - Do not post model-generated prose directly to GitHub.
@@ -59,6 +66,36 @@ metadata and diff and returns strict JSON only:
 
 The model has no tools and no GitHub token. A deterministic script parses the
 JSON and decides whether to post or update a fixed maintainer-authored comment.
+
+## Precheck Boundary
+
+The precheck is the automatic external PR path. It is not a safety proof that
+allows the existing full triage or review agents to run automatically.
+
+The current full workflows have a different risk profile:
+
+- Qwen triage runs the full agent with shell/file/worktree tools and a
+  write-capable GitHub token.
+- Qwen PR review runs `qwen --approval-mode yolo` with a write-capable GitHub
+  token and posts review comments.
+- Both read untrusted PR text and diffs, so prompt injection remains in scope
+  even when they only check out trusted base code.
+
+For external PRs, the precheck should stop at a fixed intake result:
+
+- Comment that evidence, test-plan detail, or template fields are missing.
+- Comment that a likely user-visible change needs before/after proof.
+- Optionally tell maintainers that `@qwen-code /triage` or
+  `@qwen-code /review` can be used for a full manual run.
+
+Maintainer comments remain the promotion step. Existing full triage and review
+may run on an external PR when the commenter has write-or-higher permission,
+because that is an explicit trusted maintainer decision.
+
+If automatic full review for external PRs is needed later, it should be a new
+locked-down review path: no shell, no `gh`/`git` tools, no write token in the
+model process, strict structured output, and deterministic posting by a wrapper.
+That should not be mixed into this first milestone.
 
 ## Workflow Split
 
