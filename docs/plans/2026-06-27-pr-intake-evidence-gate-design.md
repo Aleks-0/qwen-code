@@ -42,6 +42,11 @@ Create a separate PR intake workflow that runs on `pull_request_target` for PR
 open, edit, synchronize, and ready-for-review events. It runs on
 `ubuntu-latest`, not ECS.
 
+Use one concurrency group per PR:
+`qwen-pr-intake-${{ github.event.pull_request.number }}` with
+`cancel-in-progress: true`. A new push or edit should cancel stale intake work
+for that PR instead of letting older comments race with newer PR text.
+
 The workflow gathers PR text and code through GitHub APIs, without executing
 the PR:
 
@@ -49,7 +54,9 @@ the PR:
 - Changed file list.
 - Patch diff from the GitHub API.
 - Capped base/head source snippets for changed files when the patch is too
-  small, truncated, or ambiguous.
+  small, truncated, or ambiguous. Cap each file at 200 lines or 24 KiB,
+  whichever comes first, and mark the classifier input as truncated when either
+  cap is hit.
 - Template sections relevant to reviewer evidence.
 
 It then calls a constrained model classifier. The classifier receives the PR
@@ -106,6 +113,9 @@ The new PR intake workflow should cover the automatic, low-trust path:
 - Trigger on `pull_request_target` for non-draft PR open, edit, synchronize,
   and ready-for-review events.
 - Run for external fork PRs and same-repository PRs.
+- First apply a deterministic pre-filter: markdown-only, test-only,
+  lockfile-only, and repository-metadata-only changes do not require the model
+  unless the PR body itself claims user-visible CLI/TUI behavior.
 - Read PR metadata, diffs, and capped source snippets.
 - Run only the constrained evidence classifier.
 - Post or delete only the fixed marker comment.
@@ -137,6 +147,8 @@ side effects.
 The workflow should:
 
 - Use `permissions: contents: read, pull-requests: read, issues: write`.
+- Use the default `GITHUB_TOKEN` for API reads and marker-comment writes. Do not
+  pass that token, `gh`, or any write credential to the classifier process.
 - Read PR code through API-provided patches and capped source snippets.
 - Avoid checking out PR head code as a working tree.
 - Never run PR-controlled code or package lifecycle scripts.
@@ -155,6 +167,8 @@ The gate should bias toward asking for evidence:
 - Diff is unavailable or truncated -> post/update comment.
 - PR claims `N/A` evidence but classifier is not high-confidence that the
   change is non-user-visible -> post/update comment.
+- `evidence_required: false` with high confidence and no missing evidence ->
+  delete any existing marker comment.
 
 The workflow should not fail CI at first. It should leave a visible comment that
 maintainers can treat as an intake blocker during review.
@@ -169,8 +183,9 @@ The comment should be stable and short:
 - Mention that false positives are acceptable and the author can explain why
   evidence is not applicable.
 
-When the PR body is updated and evidence is present, the workflow should update
-the marker comment to resolved text or delete it if deletion is preferred.
+When the PR body is updated and evidence is present, the workflow should delete
+the marker comment. The lookup must filter by both marker string and posting
+login, so the workflow only deletes its own intake comment.
 
 ## Runner Choice
 
@@ -181,7 +196,7 @@ self-hosted ECS pool, and keeping it hosted avoids persistent-runner state risk.
 If model access later requires a private network, use a separate isolated runner
 rather than the current review/tmux ECS pool.
 
-## Ponytail Defaults
+## Minimal v1 Defaults
 
 These defaults keep the first implementation small and reversible.
 
@@ -241,3 +256,9 @@ If the classifier cannot return valid JSON, the diff/source snippets are
 truncated beyond the configured cap, or confidence is not `high`, request
 evidence with a fixed comment. This intentionally trades false positives for
 fewer false negatives.
+
+Model API errors are not classifier decisions. The wrapper should treat request
+failure, timeout, non-JSON output, or JSON that does not match the schema as
+`classifier_unavailable`, then post/update the fixed evidence comment with that
+reason code. It should not silently reuse an old result or classify the PR as
+non-user-visible.
