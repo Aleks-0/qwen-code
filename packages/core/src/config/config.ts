@@ -101,6 +101,7 @@ import { BackgroundShellRegistry } from '../services/backgroundShellRegistry.js'
 import { WorkflowRunRegistry } from '../agents/workflow-run-registry.js';
 import { FileReadCache } from '../services/fileReadCache.js';
 import { resolveStopHookBlockingCap } from '../hooks/stopHookCap.js';
+import { buildContextUsage } from '../hooks/context-usage.js';
 import {
   DEFAULT_OTLP_ENDPOINT,
   DEFAULT_SENSITIVE_SPAN_ATTRIBUTE_MAX_LENGTH,
@@ -180,13 +181,24 @@ import {
   setDebugLogSession,
   type DebugLogger,
 } from '../utils/debugLogger.js';
-import { getAutoMemoryRoot, getUserAutoMemoryRoot } from '../memory/paths.js';
+import {
+  getAutoMemoryRoot,
+  getTeamAutoMemoryRoot,
+  getUserAutoMemoryRoot,
+} from '../memory/paths.js';
 import {
   readAutoMemoryIndex,
   readUserAutoMemoryIndex,
 } from '../memory/store.js';
+import {
+  rebuildTeamAutoMemoryIndex,
+  TeamMemoryRootSecurityError,
+} from '../memory/indexer.js';
+import { syncTeamMemory } from '../memory/team-memory-sync.js';
+import { getTeamMemoryShareabilityWarning } from '../memory/team-memory-git-status.js';
 import { MemoryManager } from '../memory/manager.js';
 import { CommitAttributionService } from '../services/commitAttribution.js';
+import { isSafeModeEnv } from '../utils/safe-mode.js';
 
 const gitCoAuthorLogger = createDebugLogger('GIT_CO_AUTHOR');
 const memoryPressureConfigLogger = createDebugLogger('MEMORY_PRESSURE');
@@ -619,6 +631,55 @@ export function isGatedMcpScope(scope: McpServerScope | undefined): boolean {
   return scope === 'project' || scope === 'workspace';
 }
 
+/**
+ * Test whether a server name matches a single pattern. Patterns use simple
+ * glob semantics: `*` matches any sequence of characters (including empty),
+ * `?` matches exactly one character. A pattern without glob characters is
+ * compared as an exact string (no behavior change for existing configs).
+ * Uses an iterative two-pointer algorithm — O(n×m) worst case, no regex,
+ * no backtracking vulnerability.
+ */
+export function matchesServerPattern(name: string, pattern: string): boolean {
+  if (!pattern.includes('*') && !pattern.includes('?')) {
+    return name === pattern;
+  }
+  let ni = 0;
+  let pi = 0;
+  let starNi = -1;
+  let starPi = -1;
+  while (ni < name.length) {
+    if (
+      pi < pattern.length &&
+      (pattern[pi] === '?' || pattern[pi] === name[ni])
+    ) {
+      ni++;
+      pi++;
+    } else if (pi < pattern.length && pattern[pi] === '*') {
+      starPi = pi++;
+      starNi = ni;
+    } else if (starPi !== -1) {
+      pi = starPi + 1;
+      ni = ++starNi;
+    } else {
+      return false;
+    }
+  }
+  while (pi < pattern.length && pattern[pi] === '*') pi++;
+  return pi === pattern.length;
+}
+
+/**
+ * Test whether a server name matches any pattern in the given list.
+ * Returns false for an empty or undefined list.
+ */
+export function matchesAnyServerPattern(
+  name: string,
+  patterns: string[] | undefined,
+): boolean {
+  if (!patterns || patterns.length === 0) return false;
+  return patterns.some((p) => matchesServerPattern(name, p));
+}
+
 export class MCPServerConfig {
   constructor(
     // For stdio transport
@@ -879,6 +940,7 @@ export interface ConfigParameters {
   skipWorkflowUsageWarning?: boolean;
   computerUseEnabled?: boolean;
   computerUseMaxImageDimension?: number;
+  computerUseIdleTimeoutMs?: number;
   emitToolUseSummaries?: boolean;
   listExtensions?: boolean;
   overrideExtensions?: string[];
@@ -916,6 +978,7 @@ export interface ConfigParameters {
   importFormat?: 'tree' | 'flat';
   chatRecording?: boolean;
   chatCompression?: ChatCompressionSettings;
+  autoCompactThreshold?: number;
   interactive?: boolean;
   trustedFolder?: boolean;
   defaultFileEncoding?: FileEncodingType;
@@ -978,6 +1041,13 @@ export interface ConfigParameters {
   enableManagedAutoMemory?: boolean;
   /** Enable managed auto-dream consolidation separately from extraction. Defaults to true. */
   enableManagedAutoDream?: boolean;
+  /**
+   * Enable the git-shared team memory tier. Defaults to false (opt-in).
+   * Overridable at runtime by `QWEN_CODE_MEMORY_TEAM` ('0'/'1') via
+   * {@link Config.getTeamMemoryEnabled}.
+   */
+  enableTeamMemory?: boolean;
+  enableTeamMemorySync?: boolean;
   /** Enable automatic project skill review after tool-heavy sessions. Defaults to false. */
   enableAutoSkill?: boolean;
   /** Require user confirmation before persisting an auto-activated skill. Defaults to true. */
@@ -989,6 +1059,19 @@ export interface ConfigParameters {
    * Corresponds to the `fastModel` setting (configurable via `/model --fast`).
    */
   fastModel?: string;
+  /**
+   * Safe mode: disables all user customizations (context files, hooks,
+   * extensions, skills, MCP servers, rules) for troubleshooting.
+   * Activated via `--safe-mode` CLI flag or `QWEN_CODE_SAFE_MODE=true` env var.
+   */
+  safeMode?: boolean;
+  /**
+   * Explicit vision model for the vision bridge. When a text-only primary model
+   * receives an image, the bridge transcribes it through this model instead of
+   * auto-picking a same-provider one. Corresponds to the `visionModel` setting
+   * (configurable via `/model --vision`).
+   */
+  visionModel?: string;
   /**
    * Disable all hooks (default: false, hooks enabled).
    * Migration note: This replaces the deprecated hooksConfig.enabled setting.
@@ -1386,11 +1469,13 @@ export class Config {
   private readonly skipWorkflowUsageWarning: boolean = false;
   private readonly computerUseEnabled: boolean = true;
   private readonly computerUseMaxImageDimension?: number;
+  private readonly computerUseIdleTimeoutMs?: number;
   private readonly emitToolUseSummaries: boolean = true;
   private readonly chatRecordingEnabled: boolean;
   private readonly loadMemoryFromIncludeDirectories: boolean = false;
   private readonly importFormat: 'tree' | 'flat';
   private readonly chatCompression: ChatCompressionSettings | undefined;
+  private readonly autoCompactThreshold: number | undefined;
   private readonly interactive: boolean;
   private readonly trustedFolder: boolean | undefined;
   private readonly useRipgrep: boolean;
@@ -1414,6 +1499,7 @@ export class Config {
   private readonly skipLoopDetection: boolean;
   private readonly skipStartupContext: boolean;
   private readonly bareMode: boolean;
+  private readonly safeMode: boolean;
   private readonly warnings: string[];
   private readonly allowedHttpHookUrls: string[];
   private readonly onPersistPermissionRuleCallback?: (
@@ -1439,9 +1525,17 @@ export class Config {
   private readonly defaultFileEncoding: FileEncodingType | undefined;
   private readonly enableManagedAutoMemory: boolean;
   private readonly enableManagedAutoDream: boolean;
+  private readonly enableTeamMemory: boolean;
+  private readonly enableTeamMemorySync: boolean;
+  // Latch (keyed by projectRoot) so the "team memory enabled but not shareable"
+  // warning is emitted at most once per repo, even though refreshHierarchicalMemory
+  // may re-run. Keyed rather than a single boolean so entering a new repo (/cd)
+  // re-checks shareability instead of reusing the first repo's result.
+  private readonly teamMemoryShareabilityChecked = new Set<string>();
   private readonly enableAutoSkill: boolean;
   private readonly autoSkillConfirm: boolean;
   private fastModel?: string;
+  private visionModel?: string;
   private readonly disableAllHooks: boolean;
   private readonly stopHookBlockingCap: number;
   /** User-level hooks (always loaded regardless of trust) */
@@ -1604,6 +1698,7 @@ export class Config {
     this.skipWorkflowUsageWarning = params.skipWorkflowUsageWarning ?? false;
     this.computerUseEnabled = params.computerUseEnabled ?? true;
     this.computerUseMaxImageDimension = params.computerUseMaxImageDimension;
+    this.computerUseIdleTimeoutMs = params.computerUseIdleTimeoutMs;
     this.emitToolUseSummaries = params.emitToolUseSummaries ?? true;
     this.listExtensions = params.listExtensions ?? false;
     this.overrideExtensions = params.overrideExtensions;
@@ -1621,11 +1716,18 @@ export class Config {
       params.loadMemoryFromIncludeDirectories ?? false;
     this.importFormat = params.importFormat ?? 'tree';
     this.chatCompression = params.chatCompression;
+    this.autoCompactThreshold = params.autoCompactThreshold;
     this.interactive = params.interactive ?? false;
     this.trustedFolder = params.trustedFolder;
     this.skipLoopDetection = params.skipLoopDetection ?? false;
     this.skipStartupContext = params.skipStartupContext ?? false;
     this.bareMode = params.bareMode ?? false;
+    this.safeMode = params.safeMode ?? isSafeModeEnv();
+    if (this.safeMode) {
+      this.debugLogger.info(
+        'Safe mode active: hooks, extensions, skills, MCP servers, context files, rules disabled',
+      );
+    }
     this.warnings = params.warnings ?? [];
     this.addLegacyPlanLocationWarning();
     this.allowedHttpHookUrls = params.allowedHttpHookUrls ?? [];
@@ -1719,9 +1821,12 @@ export class Config {
     });
     this.enableManagedAutoMemory = params.enableManagedAutoMemory ?? true;
     this.enableManagedAutoDream = params.enableManagedAutoDream ?? true;
+    this.enableTeamMemory = params.enableTeamMemory ?? false;
+    this.enableTeamMemorySync = params.enableTeamMemorySync ?? false;
     this.enableAutoSkill = params.enableAutoSkill ?? true;
     this.autoSkillConfirm = params.autoSkillConfirm ?? true;
     this.fastModel = params.fastModel || undefined;
+    this.visionModel = params.visionModel || undefined;
     this.disableAllHooks = params.disableAllHooks ?? false;
     this.stopHookBlockingCap = resolveStopHookBlockingCap(
       params.stopHookBlockingCap,
@@ -1751,10 +1856,14 @@ export class Config {
     this.promptRegistry = new PromptRegistry();
     this.resourceRegistry = new ResourceRegistry();
     this.extensionManager.setConfig(this);
-    const explicitExtensionNames = this.getExplicitExtensionNames();
-    if (!this.getBareMode()) {
+    const explicitExtensionNames = this.isSafeMode()
+      ? []
+      : (this.overrideExtensions ?? []).filter(
+          (n) => n.trim() !== '' && n.toLowerCase() !== 'none',
+        );
+    if (!this.isSafeMode() && !this.getBareMode()) {
       await this.extensionManager.refreshCache();
-    } else if (explicitExtensionNames.length > 0) {
+    } else if (!this.isSafeMode() && explicitExtensionNames.length > 0) {
       await this.extensionManager.refreshCache({
         names: explicitExtensionNames,
       });
@@ -1818,9 +1927,16 @@ export class Config {
                 );
                 break;
               case 'Stop': {
+                // Extract context usage data from input with runtime validation
+                const contextUsageData = buildContextUsage(
+                  input['context_limit'] as number | undefined,
+                  (input['input_tokens'] as number | undefined) ?? 0,
+                );
+
                 const stopResult = await hookSystem.fireStopEvent(
                   (input['stop_hook_active'] as boolean) || false,
                   (input['last_assistant_message'] as string) || '',
+                  contextUsageData,
                   signal,
                 );
                 result = stopResult.finalOutput
@@ -1959,7 +2075,7 @@ export class Config {
 
     this.subagentManager = new SubagentManager(this);
     this.skillManager = new SkillManager(this);
-    if (this.getBareMode()) {
+    if (this.getBareMode() || this.isSafeMode()) {
       await this.skillManager.refreshCache();
     } else {
       await this.skillManager.startWatching();
@@ -1981,7 +2097,7 @@ export class Config {
       this.subagentManager.loadSessionSubagents(this.sessionSubagents);
     }
 
-    if (!this.getBareMode()) {
+    if (!this.getBareMode() && !this.isSafeMode()) {
       await this.extensionManager.refreshCache();
     }
 
@@ -2003,6 +2119,7 @@ export class Config {
     // construction path.
     const skipInlineMcpDiscovery =
       this.getBareMode() ||
+      this.isSafeMode() ||
       !legacyBlockingMcp ||
       options?.skipMcpDiscovery === true;
 
@@ -2044,6 +2161,7 @@ export class Config {
     if (
       skipInlineMcpDiscovery &&
       !this.getBareMode() &&
+      !this.isSafeMode() &&
       !options?.skipMcpDiscovery
     ) {
       this.startMcpDiscoveryInBackground();
@@ -2263,6 +2381,16 @@ export class Config {
   async refreshHierarchicalMemory(
     loadReason: Exclude<InstructionLoadReason, 'include'> = 'refresh',
   ): Promise<void> {
+    // Safe mode: skip all context file loading (QWEN.md, AGENTS.md, rules)
+    if (this.isSafeMode()) {
+      this.setUserMemory('');
+      this.setGeminiMdFileCount(0);
+      this.conditionalRulesRegistry = new ConditionalRulesRegistry(
+        [],
+        this.getWorkingDir(),
+      );
+      return;
+    }
     const { memoryContent, fileCount, conditionalRules, projectRoot } =
       await loadServerHierarchicalMemory(
         this.getWorkingDir(),
@@ -2285,6 +2413,88 @@ export class Config {
       // `~/.qwen/memories/MEMORY.md` must not strip the whole managed-memory
       // section out of the system prompt. Project-level read still bubbles
       // (its failure is a real config-load problem).
+      const teamMemoryEnabled =
+        this.getTeamMemoryEnabled() && this.isTrustedFolder();
+      if (this.getTeamMemoryEnabled() && !this.isTrustedFolder()) {
+        // Surface why team memory is silently absent from the prompt.
+        this.debugLogger.debug(
+          'Team memory enabled but inactive: workspace is not trusted.',
+        );
+      }
+      const teamProjectRoot = this.getProjectRoot();
+      // When the tier is active, warn (once per repo) if its directory is not
+      // actually git-shareable — no git root, or a directory-form .gitignore
+      // swallowing it — so the tier never silently shares nothing.
+      if (
+        teamMemoryEnabled &&
+        !this.teamMemoryShareabilityChecked.has(teamProjectRoot)
+      ) {
+        this.teamMemoryShareabilityChecked.add(teamProjectRoot);
+        const shareabilityWarning =
+          getTeamMemoryShareabilityWarning(teamProjectRoot);
+        if (shareabilityWarning) {
+          this.warnings.push(shareabilityWarning);
+          this.debugLogger.warn(shareabilityWarning);
+        }
+      }
+      // Rebuild the team index BEFORE syncing so the freshly generated MEMORY.md
+      // is what gets committed and pushed, not a stale one. Then, when opted in,
+      // best-effort git sync (never throws — a failure must not break session
+      // start): pull collaborators' updates and push local ones. If the sync
+      // PULLED new files, rebuild once more so the in-prompt index reflects them.
+      let teamAutoMemoryIndex: string | null = null;
+      if (teamMemoryEnabled) {
+        // rebuildTeamAutoMemoryIndex throws for two distinct classes, and only
+        // ONE may block sync:
+        //   • SECURITY — a symlink/escape rejection (TeamMemoryRootSecurityError)
+        //     means the team root could redirect the committed index OUTSIDE the
+        //     repo. Sync MUST be blocked: otherwise syncTeamMemory would git
+        //     add/commit/push that out-of-repo dir, defeating the indexer's
+        //     refusal. This invariant is non-negotiable.
+        //   • OPERATIONAL — EACCES/ENOSPC/EPERM on lstat/readdir/write. Not a
+        //     security problem, so it must NOT permanently gate legitimate sync;
+        //     it self-corrects on the next successful rebuild. Log and sync on.
+        let teamRootSecurityBlocked = false;
+        try {
+          teamAutoMemoryIndex =
+            await rebuildTeamAutoMemoryIndex(teamProjectRoot);
+        } catch (err) {
+          if (err instanceof TeamMemoryRootSecurityError) {
+            teamRootSecurityBlocked = true;
+            this.debugLogger.warn(
+              'team memory root failed the symlink/escape safety check; skipping sync',
+              err,
+            );
+          } else {
+            this.debugLogger.warn(
+              'team memory index rebuild failed (operational); not security-gating sync',
+              err,
+            );
+          }
+        }
+        if (!teamRootSecurityBlocked && this.getTeamMemorySyncEnabled()) {
+          const syncResult = await syncTeamMemory(teamProjectRoot, {
+            message: 'chore(memory): sync team memory',
+          }).catch((err) => {
+            this.debugLogger.warn('team memory sync failed', err);
+            return undefined;
+          });
+          // Surface the silent no-op: the user opted into sync but, e.g., the
+          // repo has no upstream, so nothing is shared. Debug-level — not every
+          // session should warn loudly, but an operator can see why sync did
+          // nothing.
+          if (syncResult?.skippedReason) {
+            this.debugLogger.warn(
+              `team memory sync skipped: ${syncResult.skippedReason}`,
+            );
+          }
+          if (syncResult?.pulled) {
+            teamAutoMemoryIndex = await rebuildTeamAutoMemoryIndex(
+              teamProjectRoot,
+            ).catch(() => teamAutoMemoryIndex);
+          }
+        }
+      }
       const [managedAutoMemoryIndex, userAutoMemoryIndex] = await Promise.all([
         readAutoMemoryIndex(this.getProjectRoot()),
         readUserAutoMemoryIndex().catch(() => null),
@@ -2303,6 +2513,12 @@ export class Config {
             memoryDir: getUserAutoMemoryRoot(),
             indexContent: userAutoMemoryIndex,
           },
+          teamMemoryEnabled
+            ? {
+                memoryDir: getTeamAutoMemoryRoot(this.getProjectRoot()),
+                indexContent: teamAutoMemoryIndex,
+              }
+            : undefined,
         ),
       );
     } else {
@@ -2782,15 +2998,105 @@ export class Config {
   }
 
   /**
-   * Pick an image-capable model from the registered models to use as the
-   * vision bridge model. This lets the bridge work out-of-the-box when the user
-   * already has a vision model on the SAME provider as their text-only primary
-   * (see {@link selectVisionBridgeModel} — it never reaches across providers).
-   * `runSideQuery` resolves the chosen model's credentials by id.
+   * Update the vision bridge model at runtime (e.g. `/model --vision <model>`).
+   * Pass undefined or an empty string to clear the override and fall back to
+   * same-provider auto-select.
+   */
+  setVisionModel(model: string | undefined): void {
+    this.visionModel = model || undefined;
+  }
+
+  /**
+   * Whether `model` is the same entry as the current primary model — matched on
+   * the provider identity (auth type, and baseUrl when both carry one), not just
+   * the bare id. The vision bridge must never route at the primary (it's the
+   * text-only model the bridge works around), but a cross-provider namesake —
+   * the same bare id on another provider/endpoint, e.g. `anthropic:shared-model`
+   * vs an `openai` `shared-model` primary — is a different model and stays
+   * eligible. When the primary's auth type is unknown we can't disambiguate, so
+   * fall back to a conservative bare-id match (never risk hitting the primary).
+   */
+  isCurrentPrimaryModel(model: AvailableModel): boolean {
+    if (model.id !== this.getModel()) return false;
+    const cfg = this.getContentGeneratorConfig();
+    const primaryAuthType = cfg?.authType;
+    if (primaryAuthType === undefined) return true;
+    if (model.authType !== primaryAuthType) return false;
+    const primaryBaseUrl = cfg?.baseUrl;
+    if (primaryBaseUrl !== undefined && model.baseUrl !== undefined) {
+      return model.baseUrl === primaryBaseUrl;
+    }
+    return true;
+  }
+
+  /**
+   * Resolve the user's explicit `visionModel` (set via `/model --vision`) into a
+   * bridge selection. The id is passed through verbatim so `runSideQuery` can
+   * resolve an `authType:modelId` selector; the endpoint is looked up for the
+   * egress notice. Returns `undefined` (so the caller falls back to
+   * same-provider auto-select) when no explicit model is set, the selector can't
+   * be parsed, the pinned model isn't actually configured, or it points at the
+   * text-only primary itself — those guards keep a stale/typo'd pin from firing
+   * the bridge at an unreachable, or non-image-capable, model.
+   */
+  private resolveVisionModelSelection():
+    | VisionBridgeModelSelection
+    | undefined {
+    if (!this.visionModel) return undefined;
+    let selector;
+    try {
+      selector = resolveModelId(this.visionModel);
+    } catch {
+      this.debugLogger.warn(
+        `vision model pin '${this.visionModel}' could not be parsed; falling back to auto-select`,
+      );
+      return undefined;
+    }
+    if (!selector) {
+      this.debugLogger.warn(
+        `vision model pin '${this.visionModel}' resolved to no selector; falling back to auto-select`,
+      );
+      return undefined;
+    }
+    // Each guard below silently drops the pin (the hardest failure mode to
+    // debug, hence the warn): skip fast/voice-only models (a `settings.json`
+    // pin can bypass the slash command's filter), and never route the bridge at
+    // the primary entry itself (the text-only model the bridge works around) —
+    // via the provider-aware identity check so a cross-provider namesake stays
+    // eligible.
+    const match = this.getAllConfiguredModels().find(
+      (m) =>
+        m.id === selector.modelId &&
+        (!selector.authType || m.authType === selector.authType) &&
+        !m.fastOnly &&
+        !m.voiceOnly &&
+        !this.isCurrentPrimaryModel(m),
+    );
+    if (!match) {
+      this.debugLogger.warn(
+        `vision model pin '${this.visionModel}' did not match a usable configured model ` +
+          `(removed, mistyped, fast/voice-only, or the primary itself); falling back to auto-select`,
+      );
+      return undefined;
+    }
+    return {
+      id: this.visionModel,
+      ...(match.baseUrl && { baseUrl: match.baseUrl }),
+    };
+  }
+
+  /**
+   * The vision bridge model: the explicit `visionModel` (`/model --vision`) when
+   * set, otherwise an auto-picked image-capable model on the SAME provider as
+   * the text-only primary (see {@link selectVisionBridgeModel} — auto-select
+   * never reaches across providers; an explicit override may). `runSideQuery`
+   * resolves the chosen model's credentials by id.
    *
-   * @returns A same-provider image-capable model, or `undefined`.
+   * @returns The bridge model selection, or `undefined`.
    */
   getDefaultVisionBridgeModel(): VisionBridgeModelSelection | undefined {
+    const explicit = this.resolveVisionModelSelection();
+    if (explicit) return explicit;
     const contentGeneratorConfig = this.getContentGeneratorConfig();
     return selectVisionBridgeModel(
       this.getModel(),
@@ -2862,9 +3168,17 @@ export class Config {
       this.contentGeneratorConfig.splitToolMedia = config.splitToolMedia;
       this.contentGeneratorConfig.toolResultContentFormat =
         config.toolResultContentFormat;
+      // Modalities are model-derived: a hot switch between oauth models with
+      // different image support must update them, or the vision-bridge gate and
+      // image-stripping read the previous model's modalities.
+      this.contentGeneratorConfig.modalities = config.modalities;
 
       if ('model' in sources) {
         this.contentGeneratorConfigSources['model'] = sources['model'];
+      }
+      if ('modalities' in sources) {
+        this.contentGeneratorConfigSources['modalities'] =
+          sources['modalities'];
       }
       if ('samplingParams' in sources) {
         this.contentGeneratorConfigSources['samplingParams'] =
@@ -3069,6 +3383,7 @@ export class Config {
     oldStorage: Storage,
     newStorage: Storage,
     oldDir: string,
+    opts?: { skipProcessChdir?: boolean },
   ): Promise<void> {
     this.chatRecordingService?.finalize();
     await this.chatRecordingService?.flush();
@@ -3076,13 +3391,15 @@ export class Config {
     try {
       this.moveCurrentSessionArtifacts(oldStorage, newStorage);
     } catch (error) {
-      try {
-        process.chdir(oldDir);
-      } catch (rollbackError) {
-        this.debugLogger.warn(
-          'Failed to roll back working directory after session artifact migration failed',
-          rollbackError,
-        );
+      if (!opts?.skipProcessChdir) {
+        try {
+          process.chdir(oldDir);
+        } catch (rollbackError) {
+          this.debugLogger.warn(
+            'Failed to roll back working directory after session artifact migration failed',
+            rollbackError,
+          );
+        }
       }
       throw error;
     }
@@ -3091,8 +3408,11 @@ export class Config {
   async relocateWorkingDirectory(
     newDir: string,
     expectedCanonicalDir?: string,
+    opts?: { skipProcessChdir?: boolean; skipArtifactMigration?: boolean },
   ): Promise<{ memoryRefreshError?: unknown }> {
-    const oldDir = fs.realpathSync(process.cwd());
+    const oldDir = opts?.skipProcessChdir
+      ? this.cwd
+      : fs.realpathSync(process.cwd());
     const targetPath = path.resolve(newDir);
     const expected = expectedCanonicalDir ?? fs.realpathSync(targetPath);
     if (!fs.statSync(targetPath).isDirectory()) {
@@ -3103,23 +3423,42 @@ export class Config {
       this.explicitIncludeDirectories,
     );
 
-    process.chdir(targetPath);
-    const actualCwd = fs.realpathSync(process.cwd());
-    if (actualCwd !== expected) {
-      process.chdir(oldDir);
-      throw new Error(
-        `Changed directory to ${actualCwd}, expected ${expected}.`,
-      );
+    if (!opts?.skipProcessChdir) {
+      process.chdir(targetPath);
+      const actualCwd = fs.realpathSync(process.cwd());
+      if (actualCwd !== expected) {
+        process.chdir(oldDir);
+        throw new Error(
+          `Changed directory to ${actualCwd}, expected ${expected}.`,
+        );
+      }
+    } else {
+      // ACP path: validate realpath matches expected without calling
+      // process.chdir — guards against TOCTOU swaps between the trust
+      // check and the config state update.
+      const actualCanonical = fs.realpathSync(targetPath);
+      if (actualCanonical !== expected) {
+        throw new Error(
+          `Realpath mismatch: resolved ${actualCanonical}, expected ${expected}.`,
+        );
+      }
     }
 
     const oldStorage = this.storage;
-    const newStorage = new Storage(expected);
-    await this.prepareSessionArtifactMigration(oldStorage, newStorage, oldDir);
+    if (!opts?.skipArtifactMigration) {
+      const newStorage = new Storage(expected);
+      await this.prepareSessionArtifactMigration(
+        oldStorage,
+        newStorage,
+        oldDir,
+        opts,
+      );
+      this.storage = newStorage;
+      this.chatRecordingService?.resetStoragePaths();
+    }
 
     this.targetDir = expected;
     this.cwd = expected;
-    this.storage = newStorage;
-    this.chatRecordingService?.resetStoragePaths();
     await this.refreshCurrentRuntimeStatus(expected);
     this.workspaceContext.applyRootDirectories(workspaceDirectories);
     this.fileDiscoveryService = null;
@@ -3459,12 +3798,13 @@ export class Config {
   }
 
   getMcpServers(): Record<string, MCPServerConfig> | undefined {
+    if (this.isSafeMode()) return {};
     let mcpServers = this.getMergedMcpServers();
 
     if (this.allowedMcpServers) {
       mcpServers = Object.fromEntries(
         Object.entries(mcpServers).filter(([key]) =>
-          this.allowedMcpServers?.includes(key),
+          matchesAnyServerPattern(key, this.allowedMcpServers),
         ),
       );
     }
@@ -3485,7 +3825,8 @@ export class Config {
   }
 
   isMcpServerDisabled(serverName: string): boolean {
-    if (this.excludedMcpServers?.includes(serverName)) return true;
+    if (matchesAnyServerPattern(serverName, this.excludedMcpServers))
+      return true;
     // Extension-bundled servers can be disabled individually via extension
     // preferences. Only the extension that actually contributed the server is
     // consulted, so a same-named server from another source (e.g. a shadowing
@@ -3637,11 +3978,12 @@ export class Config {
     if (!(serverName in this.getMergedMcpServers())) return undefined;
     if (
       this.allowedMcpServers &&
-      !this.allowedMcpServers.includes(serverName)
+      !matchesAnyServerPattern(serverName, this.allowedMcpServers)
     ) {
       return 'not_allowed';
     }
-    if (this.excludedMcpServers?.includes(serverName)) return 'excluded';
+    if (matchesAnyServerPattern(serverName, this.excludedMcpServers))
+      return 'excluded';
     if (this.isMcpServerPendingApproval(serverName)) return 'pending_approval';
     return undefined;
   }
@@ -3763,6 +4105,23 @@ export class Config {
    */
   addRuntimeMcpServer(name: string, config: MCPServerConfig): void {
     this.runtimeMcpServers.set(name, config);
+  }
+
+  /**
+   * Snapshot the runtime-only MCP servers added via `addRuntimeMcpServer`.
+   * Returns a shallow copy so callers can't mutate the private map.
+   *
+   * Reverse tool channel (issue #5626): a per-session Config built by
+   * `newSessionConfig` is independent from the bootstrap/workspace Config and
+   * never re-reads runtime additions (they live outside the settings layer
+   * `loadCliConfig` reloads). The daemon uses this getter to propagate the
+   * bootstrap Config's runtime MCP servers into a freshly created session
+   * Config so a session created AFTER a client MCP server was registered still
+   * discovers the client-hosted tools. Empty when nothing was runtime-added,
+   * so the inheritance step is a no-op in the common case.
+   */
+  getRuntimeMcpServers(): Record<string, MCPServerConfig> {
+    return Object.fromEntries(this.runtimeMcpServers);
   }
 
   /**
@@ -4449,6 +4808,10 @@ export class Config {
     return this.computerUseMaxImageDimension;
   }
 
+  getComputerUseIdleTimeoutMs(): number | undefined {
+    return this.computerUseIdleTimeoutMs;
+  }
+
   /**
    * Whether the turn loop should fire a fast-model call after each tool batch
    * to emit a `tool_use_summary` message. Mirrors Claude Code's
@@ -4611,7 +4974,7 @@ export class Config {
    * Check if all hooks are disabled.
    */
   getDisableAllHooks(): boolean {
-    return this.disableAllHooks || this.getBareMode();
+    return this.disableAllHooks || this.getBareMode() || this.isSafeMode();
   }
 
   getStopHookBlockingCap(): number {
@@ -4619,7 +4982,48 @@ export class Config {
   }
 
   getManagedAutoMemoryEnabled(): boolean {
-    return this.enableManagedAutoMemory && !this.getBareMode();
+    return (
+      this.enableManagedAutoMemory && !this.getBareMode() && !this.isSafeMode()
+    );
+  }
+
+  /**
+   * Whether the git-shared team memory tier is active. Opt-in: off unless the
+   * `memory.enableTeamMemory` setting is on. `QWEN_CODE_MEMORY_TEAM` overrides
+   * for tests / power users ('0' forces off, '1' forces on).
+   */
+  getTeamMemoryEnabled(): boolean {
+    if (this.getBareMode()) {
+      return false;
+    }
+    const override = process.env['QWEN_CODE_MEMORY_TEAM'];
+    if (override === '0') {
+      return false;
+    }
+    if (override === '1') {
+      return true;
+    }
+    return this.enableTeamMemory;
+  }
+
+  /**
+   * Whether the daemon/session should auto-sync team memory with the git
+   * remote (pull + commit + push). Resolves the `memory.enableTeamMemorySync`
+   * setting, with env `QWEN_CODE_MEMORY_TEAM_SYNC` ('0'/'1') as an override.
+   * Off by default since it mutates the repo and pushes. Inert in bare mode.
+   */
+  getTeamMemorySyncEnabled(): boolean {
+    if (this.getBareMode()) {
+      return false;
+    }
+    const override = process.env['QWEN_CODE_MEMORY_TEAM_SYNC'];
+    if (override === '0') {
+      return false;
+    }
+    if (override === '1') {
+      return true;
+    }
+    return this.enableTeamMemorySync;
   }
 
   isManagedMemoryAvailable(): boolean {
@@ -4627,11 +5031,13 @@ export class Config {
   }
 
   getManagedAutoDreamEnabled(): boolean {
-    return this.enableManagedAutoDream && !this.getBareMode();
+    return (
+      this.enableManagedAutoDream && !this.getBareMode() && !this.isSafeMode()
+    );
   }
 
   getAutoSkillEnabled(): boolean {
-    return this.enableAutoSkill && !this.getBareMode();
+    return this.enableAutoSkill && !this.getBareMode() && !this.isSafeMode();
   }
 
   getAutoSkillConfirmEnabled(): boolean {
@@ -4639,7 +5045,7 @@ export class Config {
   }
 
   getPreventSystemSleepEnabled(): boolean {
-    return this.preventSystemSleep;
+    return this.preventSystemSleep && !this.isSafeMode();
   }
 
   /**
@@ -4674,7 +5080,7 @@ export class Config {
    * Used by HookRegistry to load project-specific hooks with proper source attribution.
    */
   getProjectHooks(): { [K in HookEventName]?: HookDefinition[] } | undefined {
-    if (this.getBareMode()) {
+    if (this.getBareMode() || this.isSafeMode()) {
       return undefined;
     }
     // Only return project hooks if workspace is trusted
@@ -4692,7 +5098,7 @@ export class Config {
    * Used by HookRegistry to load user-specific hooks with proper source attribution.
    */
   getUserHooks(): { [K in HookEventName]?: HookDefinition[] } | undefined {
-    if (this.getBareMode()) {
+    if (this.getBareMode() || this.isSafeMode()) {
       return undefined;
     }
     // Prefer new userHooks field, fall back to hooks for backward compatibility
@@ -4712,12 +5118,6 @@ export class Config {
     } else {
       return extensions;
     }
-  }
-
-  private getExplicitExtensionNames(): string[] {
-    return (this.overrideExtensions ?? []).filter(
-      (name) => name.trim() !== '' && name.toLowerCase() !== 'none',
-    );
   }
 
   getActiveExtensions(): Extension[] {
@@ -4743,7 +5143,7 @@ export class Config {
 
     if (this.allowedMcpServers) {
       Object.entries(mcpServers).forEach(([key, server]) => {
-        const isAllowed = this.allowedMcpServers?.includes(key);
+        const isAllowed = matchesAnyServerPattern(key, this.allowedMcpServers);
         if (!isAllowed) {
           blockedMcpServers.push({
             name: key,
@@ -4784,7 +5184,9 @@ export class Config {
    * If empty, all URLs are allowed (subject to SSRF protection).
    */
   getAllowedHttpHookUrls(): string[] {
-    return this.getBareMode() ? [] : this.allowedHttpHookUrls;
+    return this.getBareMode() || this.isSafeMode()
+      ? []
+      : this.allowedHttpHookUrls;
   }
 
   isTrustedFolder(): boolean {
@@ -4882,6 +5284,14 @@ export class Config {
     return this.chatCompression;
   }
 
+  getAutoCompactThreshold(): number | undefined {
+    const threshold = this.autoCompactThreshold;
+    if (typeof threshold === 'number' && threshold > 0 && threshold <= 1) {
+      return threshold;
+    }
+    return undefined;
+  }
+
   isInteractive(): boolean {
     return this.interactive;
   }
@@ -4933,6 +5343,14 @@ export class Config {
 
   getBareMode(): boolean {
     return this.bareMode;
+  }
+
+  /**
+   * Safe mode disables all user customizations (context files, hooks,
+   * extensions, skills, MCP servers, rules) for troubleshooting.
+   */
+  isSafeMode(): boolean {
+    return this.safeMode;
   }
 
   getTruncateToolOutputThreshold(): number {

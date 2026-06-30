@@ -86,6 +86,10 @@ export interface SettingDefinition {
   options?: readonly SettingEnumOption[];
   /** Schema for array items when type is 'array' */
   items?: SettingItemDefinition;
+  /** Minimum value for number-type settings. */
+  minimum?: number;
+  /** Maximum value for number-type settings. */
+  maximum?: number;
   /**
    * Primitive shapes a field accepted before it was expanded to its current
    * type. The exported JSON Schema wraps the field in `anyOf` so values from
@@ -480,6 +484,7 @@ const SETTINGS_SCHEMA = {
         category: 'General',
         requiresRestart: false,
         default: 5,
+        minimum: 1,
         description:
           "How many minutes the terminal must be blurred before an auto-recap fires on the next focus-in. Matches Claude Code's default of 5 minutes; raise if you briefly alt-tab and do not want recaps to pile up.",
         showInDialog: true,
@@ -493,6 +498,7 @@ const SETTINGS_SCHEMA = {
         // surprised when a mid-session edit doesn't take effect immediately.
         requiresRestart: true,
         default: 30,
+        minimum: 0,
         description:
           'Number of days to retain ~/.qwen/file-history/ session backups used by /rewind and background subagent transcripts under <projectDir>/subagents/. Data older than this is removed by a background housekeeping pass that runs at most once per day. Set to 0 for minimum retention (~1 hour) — protects sessions touched in the last hour, plus the currently active session.',
         showInDialog: true,
@@ -834,6 +840,16 @@ const SETTINGS_SCHEMA = {
             default: false,
             description:
               'Whether to collapse history by default when resuming a session.',
+            showInDialog: false,
+          },
+          collapsePreviewCount: {
+            type: 'number',
+            label: 'Collapse Preview Count',
+            category: 'UI',
+            requiresRestart: false,
+            default: 0,
+            description:
+              'Number of most recent user turns to keep visible when collapsing history on resume. 0 collapses all restored history by default; -1 shows all restored history.',
             showInDialog: false,
           },
         },
@@ -1244,6 +1260,17 @@ const SETTINGS_SCHEMA = {
     default: '',
     description:
       'Model used for generating prompt suggestions and speculative execution. Leave empty to use the main model. A smaller/faster model (e.g., qwen3-coder-flash) reduces latency and cost.',
+    showInDialog: true,
+  },
+
+  visionModel: {
+    type: 'string',
+    label: 'Vision Model',
+    category: 'Model',
+    requiresRestart: false,
+    default: '',
+    description:
+      'Image-capable model used as the vision bridge: when a text-only main model receives an image, it is transcribed by this model first. Set with /model --vision. Leave empty to auto-pick a same-provider vision model.',
     showInDialog: true,
   },
 
@@ -1671,6 +1698,21 @@ const SETTINGS_SCHEMA = {
           },
         },
       },
+      autoCompactThreshold: {
+        type: 'number',
+        label: 'Auto-Compact Threshold',
+        category: 'Context',
+        requiresRestart: false,
+        default: undefined as number | undefined,
+        description:
+          'Fraction of context window at which auto-compaction triggers (greater than 0, up to 1). Default is 0.7 (70%).',
+        showInDialog: false,
+        jsonSchemaOverride: {
+          type: 'number',
+          minimum: 0.01,
+          maximum: 1,
+        },
+      },
     },
   },
 
@@ -1721,6 +1763,26 @@ const SETTINGS_SCHEMA = {
         default: true,
         description:
           'Ask for confirmation before auto-generated skills are added to the skill library. When off, auto-skills are saved immediately.',
+        showInDialog: false,
+      },
+      enableTeamMemory: {
+        type: 'boolean',
+        label: 'Enable Team Memory',
+        category: 'Memory',
+        requiresRestart: false,
+        default: false,
+        description:
+          'Enable a project memory tier shared with collaborators via the git-tracked `.qwen/team-memory/` directory. Off by default; writes to it are secret-scanned and reviewable in the git diff.',
+        showInDialog: false,
+      },
+      enableTeamMemorySync: {
+        type: 'boolean',
+        label: 'Enable Team Memory Git Sync',
+        category: 'Memory',
+        requiresRestart: false,
+        default: false,
+        description:
+          'When team memory is enabled, automatically commit, fast-forward-pull, and push the `.qwen/team-memory/` directory at session start so collaborators stay in sync. Off by default; requires a configured git upstream.',
         showInDialog: false,
       },
     },
@@ -2232,8 +2294,20 @@ const SETTINGS_SCHEMA = {
             requiresRestart: true,
             default: true,
             description:
-              'When enabled (default), the cua-driver computer_use__* tools are registered as deferred built-ins.',
+              'When enabled (default), the cua-driver computer_use__* tools are registered as deferred built-ins. Set to false to prevent the driver from being downloaded or spawned.',
             showInDialog: true,
+          },
+          idleTimeoutMs: {
+            type: 'number',
+            label: 'Idle Timeout',
+            category: 'Tools',
+            requiresRestart: true,
+            default: 300000,
+            minimum: 0,
+            maximum: 2147483647,
+            description:
+              'Milliseconds to keep the cua-driver process alive after the last computer_use__* call. The default is 300000 (5 minutes). Set to 0 to keep it running until qwen-code exits.',
+            showInDialog: false,
           },
           maxImageDimension: {
             type: 'number',
@@ -2352,7 +2426,8 @@ const SETTINGS_SCHEMA = {
         // restart-required.
         requiresRestart: false,
         default: undefined as string[] | undefined,
-        description: 'A list of MCP servers to allow.',
+        description:
+          'A list of MCP servers to allow. Supports glob patterns (e.g. "*puppeteer*").',
         showInDialog: false,
         mergeStrategy: MergeStrategy.CONCAT,
       },
@@ -2365,7 +2440,8 @@ const SETTINGS_SCHEMA = {
         // restart-required.
         requiresRestart: false,
         default: undefined as string[] | undefined,
-        description: 'A list of MCP servers to exclude.',
+        description:
+          'A list of MCP servers to exclude. Supports glob patterns (e.g. "*puppeteer*"). Takes precedence over mcp.allowed.',
         showInDialog: false,
         mergeStrategy: MergeStrategy.CONCAT,
       },
